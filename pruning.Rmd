@@ -1,0 +1,462 @@
+---
+title: "Pruning fgsea results using the GO graph"
+author: "Giuseppe D'Agostino"
+date: "2/25/2021"
+output: github_document
+references:
+- id: se
+  title: SummarizedExperiment - ummarizedExperiment container. R package version 1.20.0.
+  author:
+  - family: Morgan
+    given: Martin
+  - family: Obenchain
+    given: Valerie
+  - family: Hester
+    given: Jim
+  - family: Pagès
+    given: Hervé
+  container-title: Bioconductor
+  URL: 'https://bioconductor.org/packages/AnnotationDbi'
+- id: fgsea
+  title: Fast gene set enrichment analysis
+  author:
+  - family: Korotkevich
+    given: Gennady
+  - family: Sukhov
+    given: Vladimir
+  - family: Budin
+    given: Nikolay
+  - family: Shpak
+    given: Boris
+  - family: Artyomov
+    given: Maxim
+  - family: Sergushichev
+    given: Alexey
+  container-title: biorXiv
+  URL: 'https://www.biorxiv.org/content/10.1101/060012v3'
+  DOI: 10.1101/060012
+  issued:
+    year: 2021
+- id: msigdbr
+  title: msigdbr - MSigDB Gene Sets for Multiple Organisms in a Tidy Data Format. R package version 7.2.1.
+  author:
+  - family: Dolgalev
+    given: Igor
+  container-title: CRAN
+  URL: 'https://CRAN.R-project.org/package=msigdbr'
+- id: godb
+  title: GO.db - A set of annotation maps describing the entire Gene Ontology. R package version 3.8.2.
+  author:
+  - family: Calrson
+    given: Marc
+  container-title: Bioconductor
+  URL: 'https://bioconductor.org/packages/GO.db'
+- id: annotationdbi
+  title: AnnotationDbi - Manipulation of SQLite-based annotations in Bioconductor. R package version 1.52.0
+  author:
+  - family: Pagès
+    given: Hervé
+  - family: Calrson
+    given: Marc
+  - family: Falcon
+    given: Seth
+  - family: Li
+    given: Nianhua
+  container-title: Bioconductor
+  URL: 'https://bioconductor.org/packages/AnnotationDbi'
+- id: igraph
+  title: ipgrah - Network Analysis and Visualization. R package version 1.2.6.
+  author:
+  - family: Csárdi 
+    given: Gábor
+  container-title: CRAN
+  URL: 'https://CRAN.R-project.org/package=igraph'              
+- id: rgraphviz
+  title: Provides plotting capabilities for R graph objects. R package version 2.34.0.  
+  author:
+  - family: Hansen 
+    given: Kasper Daniel
+  - family: Gentry 
+    given: Jeff
+  - family: Long 
+    given: Li
+  - family: Gentleman 
+    given: Robert
+  - family: Falcon 
+    given: Seth
+  - family: Hahne 
+    given: Florian
+  - family: Sarkar 
+    given: Deepayan
+  container-title: Bioconductor
+  URL: 'https://bioconductor.org/packages/Rgraphviz'  
+- id: setrank
+  title: Avoiding the pitfalls of gene set enrichment analysis with SetRank
+  author:
+  - family: Simillion
+    given: Cedric
+  - family: Liechti
+    given: Robin
+  - family: Lischer
+    given: Heidi
+  - family: Ioannidis
+    given: Vassilios
+  - family: Bruggmann
+    given: Rémy
+  container-title: BMC Bioinformatics
+  URL: 'https://www.biorxiv.org/content/10.1101/060012v3'
+  DOI: 10.1186/s12859-017-1571-6
+  issued:
+    year: 2017  
+---
+---
+nocite: | 
+  @msigdbr, @se, @godb, @annotationdbi, @igraph, @rgraphviz
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load necessary libraries
+
+```{r libraries, message = FALSE}
+library(GO.db)
+library(fgsea)
+library(BiocParallel)
+library(msigdbr)
+library(tidyverse)
+library(ggplot2)
+library(AnnotationDbi)
+library(igraph)
+library(Rgraphviz)
+library(biomaRt)
+library(pheatmap)
+library(colorspace)
+library(SummarizedExperiment)
+```
+
+We load a `SummarizedExperiment` with differential expression results from a publicly available mouse dataset (GSE111434) in which there is a strong transcriptional effect.
+
+```{r load_dataset}
+o <- readRDS("DEA_GSE111434_KA.rds")
+res <- rowData(o)$DEA.KA
+head(res)
+```
+
+We load the MGI gene symbols to entrez id conversion table.
+
+```{r id_table}
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+entrezbm <- getBM(attributes=c("ensembl_gene_id", "mgi_symbol","entrezgene_id"), mart = mart)
+entrezbm <- entrezbm[!duplicated(entrezbm$mgi_symbol),]
+rownames(entrezbm) <- entrezbm$mgi_symbol
+```
+
+Ranking genes by log2(fold change) upon kainic acid treatment as an input to `fgsea` [@fgsea].
+
+```{r rank_genes}
+
+res$entrezgene_id <- entrezbm[rownames(res), "entrezgene_id"]
+
+stat_ranks_frame <- as.data.frame(res) %>% 
+  dplyr::select(entrezgene_id, logFC) %>% 
+  na.omit() %>% 
+  distinct() %>% 
+  group_by(entrezgene_id) %>% 
+  summarize(stat=mean(logFC))
+
+stat_ranks <- deframe(stat_ranks_frame)
+```
+
+We use `msigdbr` to retrieve the C5 geneset (Gene Ontology), and we format it to create a suitable input for `fgsea`. It is important to retain the pathway name as the GO id.
+
+```{r wrangle_genesets}
+go.genesets <- msigdbr(species = "Mus musculus", category = "C5")
+go.genesets = as.data.frame(go.genesets)
+go.genesets$entrez_gene = as.character(go.genesets$entrez_gene)
+go.list <- lapply(unique(go.genesets$gs_name), function(x) go.genesets[go.genesets$gs_name == x, "entrez_gene"])
+names(go.list) = unique(go.genesets$gs_exact_source)  ##IMPORTANT: use gs_exact_source to retain the GO ID
+```
+
+Running `fgsea` using standard parameters and parallelization.
+
+```{r gsea}
+set.seed(69420)
+
+res_gsea <- fgsea(pathways = go.list, 
+                      stats = stat_ranks,
+                      BPPARAM = SnowParam())
+```
+
+Formatting the `fgsea` result to include GO ID, subcategory (important for later) and pathway names. 
+
+We remove the HP ontology and recalculate adjusted p values using the FDR method.
+
+```{r results_formatting}
+goid_to_name <- as.data.frame(cbind(unique(go.genesets$gs_exact_source), unique(go.genesets$gs_name)))
+goid_and_subcat <- as.data.frame(unique(go.genesets[,c("gs_subcat", "gs_exact_source")]))
+rownames(goid_and_subcat) <- goid_and_subcat$gs_exact_source
+colnames(goid_to_name) <- c("GO_ID", "name")
+rownames(goid_to_name) <- goid_to_name$GO_ID
+goid_to_name$subcat <- goid_and_subcat[rownames(goid_and_subcat), "gs_subcat"]
+
+res_gsea$name <- goid_to_name[res_gsea$pathway, "name"]
+res_gsea$subcat <- goid_to_name[res_gsea$pathway, "subcat"]
+res_gsea$subcat <- gsub(res_gsea$subcat, pattern = "GO:", replacement = "")
+
+res_gsea <- res_gsea[res_gsea$subcat != "HPO"] # we remove HP terms because they are not in the GO graph
+res_gsea$padj <- p.adjust(res_gsea$pval, method = "fdr")
+```
+
+The pruning function is very simple and uses `GO.db` to access the GO DAG (directed acyclic graph).
+
+It performs a series of operations on GSEA results:
+
+- keeps significant (nominal p value) terms that have no children
+
+- for non-significant terms, only keeps those that have no children
+
+- if a term is significant but has at least a significant child, it is removed
+
+- if a term is significant but has a non-significant child, it is kept
+
+```{r prune_function}
+pruneGO_FGSEA <- function(fgsea_res, 
+                         go_sub = c("BP", "MF", "CC"),
+                         alpha = 0.05){
+  
+  fgsea_res <- fgsea_res[which(fgsea_res$subcat == go_sub),]
+
+  if(go_sub == "BP") go_subcategory = GOBPCHILDREN 
+    else  if(go_sub == "MF") go_subcategory = GOMFCHILDREN
+    else  if(go_sub == "CC") go_subcategory = GOCCCHILDREN 
+  
+  go_children <- as.list(go_subcategory)
+  go_haschildren <- go_children[!is.na(go_children)]
+  
+  fgsea_res$has_children <- sapply(fgsea_res$pathway, function(x) x %in% names(go_haschildren))
+
+  fgsea_res_sig <- fgsea_res[fgsea_res$pval < alpha,]
+
+  fgsea_res_sig$has_sig_children <- sapply(fgsea_res_sig$pathway, 
+                                            function(x) any(go_haschildren[[x]] %in% fgsea_res_sig$pathway))
+   
+  fgsea_res_sig$keep <- (fgsea_res_sig$has_children == FALSE) | (fgsea_res_sig$has_children == TRUE & fgsea_res_sig$has_sig_children == FALSE) 
+  
+  fgsea_res_ns_childless <- fgsea_res[which(fgsea_res$pval >= alpha & !fgsea_res$has_children),]
+
+  pruned <- rbind(fgsea_res_sig[fgsea_res_sig$keep,1:11], fgsea_res_ns_childless[,1:11])
+  
+  pruned$padj_2 <- p.adjust(pruned$pval, method = "fdr")
+  
+  pruned_len <- length(setdiff(pruned$pathway, fgsea_res_sig$pathway))
+  message("Pruned ", pruned_len, " terms.")
+  
+  return(pruned)
+  
+ }
+```
+
+We apply the function to our GSEA results. Since every subcategory has its own DAG, we need to apply it separately to each subcategory.
+
+```{r prune_results}
+res_gsea_bp_pruned <- pruneGO_FGSEA(res_gsea, go_sub = "BP", alpha = 0.05)
+res_gsea_mf_pruned <- pruneGO_FGSEA(res_gsea, go_sub = "MF", alpha = 0.05)
+res_gsea_cc_pruned <- pruneGO_FGSEA(res_gsea, go_sub = "CC", alpha = 0.05)
+```
+
+Results are merged. FDR-adjusted p values can be recomputed on the whole table. This is probably aggressive, as we could consider each DAG/subcategory as an independent experiment. We save this more aggressive adjustment as a separate column.
+
+```{r recompute_fdr}
+res_gsea_all_pruned <- rbind(res_gsea_bp_pruned, res_gsea_mf_pruned, res_gsea_cc_pruned)
+res_gsea_all_pruned$padj_3 <- p.adjust(res_gsea_all_pruned$pval, method = 'fdr')
+```
+
+We check the nominal p value histogram as a sanity check: we did not alter the distribution.
+
+```{r pval_hist}
+hist(res_gsea_all_pruned$pval, xlab = "nominal p value", main = "GSEA nominal p value distribution")
+```
+
+Selecting significant (adjusted p value) results:
+
+```{r select_sig}
+res_gsea_all_pruned <- as.data.frame(res_gsea_all_pruned)
+rownames(res_gsea_all_pruned) <- res_gsea_all_pruned$pathway
+res_gsea_all_pruned_sig <- res_gsea_all_pruned[res_gsea_all_pruned$padj_2 < 0.05,]
+```
+
+How many significant terms did we recover? We compare the FDR values in the original results table to the pruned one. Any significant term that was not initially below the threshold (arbitrarily set at 0.05, above the red line in the plot) but is now below threshold in the pruned table, is a "recovered term". Some of these "recovered terms" really benefit from this procedure, as they have very low adjusted p-values which would not have been reported as significant in the non-pruned table. However, this is most likely due to the fact that we split the results in 3 sub-categories and performed correction independently. 
+
+```{r terms_gained}
+
+res_gsea <- as.data.frame(res_gsea)
+rownames(res_gsea) <- res_gsea$pathway
+
+plot(x = -log10(res_gsea_all_pruned_sig$padj_2), y = -log10(res_gsea[rownames(res_gsea_all_pruned_sig) ,"padj"]),
+     pch = 16,
+     cex = 0.8,
+     ylab = "-log10(adjusted p) without pruning",
+     xlab = "-log10(adjusted p) with pruning")
+
+abline(h = -log10(0.05), col = 'red')
+abline(0, 1, lty = 2)
+
+cat("Number of recovered terms: ", nrow(res_gsea_all_pruned_sig) -  length(which(res_gsea[res_gsea$pathway %in% res_gsea_all_pruned_sig$pathway,"padj"] < 0.05)))
+```
+If we apply the more stringent FDR correction, we can see how the number of recovered terms is smaller:
+
+```{r gained_fdr_stringent}
+res_gsea_all_pruned_sig_2 <- res_gsea_all_pruned[res_gsea_all_pruned$padj_3 < 0.05,]
+
+
+plot(x = -log10(res_gsea_all_pruned_sig_2$padj_3), y =  -log10(res_gsea[rownames(res_gsea_all_pruned_sig_2) ,"padj"]),
+     pch = 16,
+     cex = 0.8,
+     ylab = "-log10(adjusted p) without pruning",
+     xlab = "-log10(adjusted p) with pruning")
+
+abline(h = -log10(0.05), col = 'red')
+abline(0, 1, lty = 2)
+
+cat("Number of recovered terms: ", nrow(res_gsea_all_pruned_sig_2) -  length(which(res_gsea[res_gsea$pathway %in% res_gsea_all_pruned_sig_2$pathway,"padj"] < 0.05)))
+```
+
+
+Top 30 terms (ranked by adjusted p value)
+
+```{r top30, fig.width = 18, fig.height = 8}
+fgsea_top30 <- res_gsea_all_pruned_sig[order(abs(res_gsea_all_pruned_sig$NES), decreasing = TRUE)[1:30],]
+
+ggplot(fgsea_top30, aes(x = reorder(name, NES), y = NES, col = subcat )) + 
+  geom_point(aes(size = -log10(padj_2))) + 
+  coord_flip() + 
+  facet_wrap(~subcat) +
+  theme_bw()
+
+```
+
+
+Top 30 in the non-pruned table:
+
+```{r top30_nonpruned, fig.width = 18, fig.height = 8}
+ res_gsea$padj_2 <- p.adjust(res_gsea$pval, method = "fdr")
+ res_gsea_sig <-  res_gsea[ res_gsea$padj_2 < 0.05,]
+fgsea_top30_nonpruned <- res_gsea_sig[order(abs(res_gsea_sig$NES), decreasing = TRUE)[1:30],]
+
+ggplot(fgsea_top30_nonpruned, aes(x = reorder(name, NES), y = NES, col = subcat )) + 
+  geom_point(aes(size = -log10(padj_2))) + 
+  coord_flip() + 
+  facet_wrap(~subcat) +
+  theme_bw()
+```
+
+There are many overlapping terms regarding skeletal development, including vague ones, in the non-pruned significant results. 
+
+As a last check, did the pruning algorithm actually work? We draw the induced DAGs using as inducing set the significant (nominal p value) terms in the unpruned table, marking in red the terms retained in the pruned table and in blue the pruned terms that are significant after FDR correction. We want to make sure that the only blue/red nodes are categories with no children. DAGs are retrieved through the `makeGOgraph` function from `AnnotationDbi` , wrangled through `igraph` and rendered using `Rgraphviz` .
+
+```{r, check_graphs}
+graph.par(list(nodes=list(fontsize=40)))
+
+res_gsea_sig_nominal <- res_gsea[res_gsea$pval < 0.05,]
+res_gsea_mf_pruned_sig <- res_gsea_mf_pruned[res_gsea_mf_pruned$padj_2 < 0.05,]
+
+mfgraph <- igraph::graph_from_graphnel(makeGOGraph("mf")) 
+mfgraph_induced <- igraph::subgraph(mfgraph, v = which(names(V(mfgraph)) %in% res_gsea_sig_nominal$pathway))
+mfgraphnel <- igraph::igraph.to.graphNEL(mfgraph_induced)
+mfgraphnel <- layoutGraph(mfgraphnel)
+nodeRenderInfo(mfgraphnel)$fill[res_gsea_mf_pruned$pathway] <- 'red' 
+nodeRenderInfo(mfgraphnel)$col[res_gsea_mf_pruned$pathway] <- 'red' 
+nodeRenderInfo(mfgraphnel)$fill[res_gsea_mf_pruned_sig$pathway] <- 'blue' 
+nodeRenderInfo(mfgraphnel)$col[res_gsea_mf_pruned_sig$pathway] <- 'blue' 
+renderGraph(mfgraphnel)
+
+
+res_gsea_bp_pruned_sig <- res_gsea_bp_pruned[res_gsea_bp_pruned$padj_2 < 0.05,]
+
+bpgraph <- igraph::graph_from_graphnel(makeGOGraph("bp")) 
+bpgraph_induced <- igraph::subgraph(bpgraph, v = which(names(V(bpgraph)) %in% res_gsea_sig_nominal$pathway))
+bpgraphnel <- igraph::igraph.to.graphNEL(bpgraph_induced)
+bpgraphnel <- layoutGraph(bpgraphnel)
+nodeRenderInfo(bpgraphnel)$fill[res_gsea_bp_pruned$pathway] <- 'red' 
+nodeRenderInfo(bpgraphnel)$col[res_gsea_bp_pruned$pathway] <- 'red' 
+nodeRenderInfo(bpgraphnel)$fill[res_gsea_bp_pruned_sig$pathway] <- 'blue' 
+nodeRenderInfo(bpgraphnel)$col[res_gsea_bp_pruned_sig$pathway] <- 'blue' 
+renderGraph(bpgraphnel)
+
+
+
+res_gsea_cc_pruned_sig <- res_gsea_cc_pruned[res_gsea_cc_pruned$padj_2 < 0.05,]
+
+ccgraph <- igraph::graph_from_graphnel(makeGOGraph("cc")) 
+ccgraph_induced <- igraph::subgraph(ccgraph, v = which(names(V(ccgraph)) %in% res_gsea_sig_nominal$pathway))
+ccgraphnel <- igraph::igraph.to.graphNEL(ccgraph_induced)
+ccgraphnel <- layoutGraph(ccgraphnel)
+nodeRenderInfo(ccgraphnel)$fill[res_gsea_cc_pruned$pathway] <- 'red' 
+nodeRenderInfo(ccgraphnel)$col[res_gsea_cc_pruned$pathway] <- 'red' 
+nodeRenderInfo(ccgraphnel)$fill[res_gsea_cc_pruned_sig$pathway] <- 'blue' 
+nodeRenderInfo(ccgraphnel)$col[res_gsea_cc_pruned_sig$pathway] <- 'blue' 
+renderGraph(ccgraphnel)
+```
+
+Even though the significant sets are now the most specific ones, some overlaps may still be present. This is a potential issue, as discussed in the `setRank` paper [@setrank]. We check whether this is the case and to which extent these sets overlap plotting the matrix of pairwise Jaccard indices:
+
+```{r overlapping_sets}
+sig_mf_setlist <- go.list[res_gsea_mf_pruned_sig$pathway]
+
+mf_pairwise <- as.data.frame(expand.grid(names(sig_mf_setlist), names(sig_mf_setlist)))
+
+mf_pairwise$jaccard <- apply(mf_pairwise, 1, function(x) length(intersect(sig_mf_setlist[[x[1]]], sig_mf_setlist[[x[2]]])) / length(union(sig_mf_setlist[[x[1]]], sig_mf_setlist[[x[2]]])))
+         
+jacmat_mf <- matrix(mf_pairwise$jaccard, nrow = length(sig_mf_setlist), byrow = TRUE)
+rownames(jacmat_mf) <- names(sig_mf_setlist)
+colnames(jacmat_mf) <- names(sig_mf_setlist)
+
+pheatmap(jacmat_mf, 
+        cluster_cols = TRUE, 
+        cluster_rows = TRUE,
+        col = colorspace::sequential_hcl("Sunset", n = 25),
+        main = "Jaccard index between significant MF sets")
+
+sig_bp_setlist <- go.list[res_gsea_bp_pruned_sig$pathway]
+
+bp_pairwise <- as.data.frame(expand.grid(names(sig_bp_setlist), names(sig_bp_setlist)))
+
+bp_pairwise$jaccard <- apply(bp_pairwise, 1, function(x) length(intersect(sig_bp_setlist[[x[1]]], sig_bp_setlist[[x[2]]])) / length(union(sig_bp_setlist[[x[1]]], sig_bp_setlist[[x[2]]])))
+         
+jacmat_bp <- matrix(bp_pairwise$jaccard, nrow = length(sig_bp_setlist), byrow = TRUE)
+rownames(jacmat_bp) <- names(sig_bp_setlist)
+colnames(jacmat_bp) <- names(sig_bp_setlist)
+
+pheatmap(jacmat_bp, 
+        cluster_cols = TRUE, 
+        cluster_rows = TRUE,
+        col = colorspace::sequential_hcl("Sunset", n = 25),
+        main = "Jaccard index between significant BP sets")
+
+sig_cc_setlist <- go.list[res_gsea_cc_pruned_sig$pathway]
+
+cc_pairwise <- as.data.frame(expand.grid(names(sig_cc_setlist), names(sig_cc_setlist)))
+
+cc_pairwise$jaccard <- apply(cc_pairwise, 1, function(x) length(intersect(sig_cc_setlist[[x[1]]], sig_cc_setlist[[x[2]]])) / length(union(sig_cc_setlist[[x[1]]], sig_cc_setlist[[x[2]]])))
+         
+jacmat_cc<- matrix(cc_pairwise$jaccard, nrow = length(sig_cc_setlist), byrow = TRUE)
+rownames(jacmat_cc) <- names(sig_cc_setlist)
+colnames(jacmat_cc) <- names(sig_cc_setlist)
+
+pheatmap(jacmat_cc, 
+        cluster_cols = TRUE, 
+        cluster_rows = TRUE,
+        col = colorspace::sequential_hcl("Sunset", n = 25),
+        main = "Jaccard index between significant CC sets")
+```
+
+Although the overlaps seem to be few, they are present and we must acknowledge them. Overlaps make it slightly more difficult to define how specifically enriched a set is compared to another. A simple argument is that both sets are being regulated at the same time (since sets are somewhat arbitrarily defined). For instance, two significant sets that are highly overlapping in the CC subcategory are "Actin filament bundle" and "Actomyosin". Although they are in different parts of the DAG, they overlap and most likely are both regulated, especially considering how molecularly similar they are. 
+
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+## References
