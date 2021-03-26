@@ -1,10 +1,12 @@
-# Pruning FGSEA results
+# Pruning pathway analysis results
 
-[Tutorial](https://github.com/langleylab/pruning/blob/main/pruning.md) on how to prune FGSEA results according to the GO graph in R.
+[Tutorial](https://github.com/langleylab/pruning/blob/main/gsea_pruning.md) on how to prune FGSEA results according to the GO graph in R.
+[Tutorial](https://github.com/langleylab/pruning/blob/main/gost_pruning.md) on how to prune g:Profiler GO ORA results according to the GO graph in R.
 
 ## TL;DR
 
 FGSEA performed on GO gene sets overcorrects p values and reports non-specific terms because it treats every Gene Ontology category independently. In this tutorial we propose a simple approach to pruning GSEA results making use of the GO graph and show how terms can be "recovered" and give better biological insight.
+Similarly, GO over-representation analyses performed by gprofiler2 shows repetitive terms, even thouth the FDR correction does respect the hierarchical structure. In a similar tutorial we propose the same approach to show specific terms.
 
 ## Small introduction
 
@@ -58,6 +60,9 @@ Let's instead consider another kind of experiment: we gather blood samples from 
 As mentioned above, we can run ORA using Gene Ontology sets. Each over-representation test is carried independently on each set, so the usual multiple-test correction strategies apply. However, GO sets are not independent: they exist in a hierarchical structure in which smaller, more specific sets - children - are contained within one (or more) broader sets - parents. Sets relate to each other in structures called Directed Acyclic Graphs (DAGs), in which sets are nodes and their hierarchical relation is determined by the edges going from more specific/smaller to more general/larger sets. GO has 3 DAGs: Biological Processes (BP), Molecular Function (MF), and Cellular Compartment (CC). So we cannot applying multiple test correction on the results from a GO ORA, as sets are not independent, and we are not really testing whether "limb development" is over-represented as opposed to the more specific "arm development". Moreover, the multiple test correction procedures will lead us to reject terms just based on the sheer number of sets which affects the amount of correction, resulting in many false negeatives.
 
 Several ORA tools deal with this fact by simply removing terms that have enriched children, so that only the most specific, significant terms are left. Other strategies can also be used where the hierarchical filtering is not as strong, and weights are given to each gene set based on their position on the DAG. Whatever the strategy, the final result is that of a more interpretable list of pathways, in which the number of false negatives is greatly reduced.
+
+In the tutorial we provide a solution to filter the results of a popular ORA tool, 'gprofiler2', which does not currently perform this kind of pruning.
+
 
 ## GSEA 
 
