@@ -1,6 +1,7 @@
 # Pruning pathway analysis results
 
 [Tutorial](https://github.com/langleylab/pruning/blob/main/gsea_pruning.md) on how to prune FGSEA results according to the GO graph in R.
+
 [Tutorial](https://github.com/langleylab/pruning/blob/main/gost_pruning.md) on how to prune g:Profiler GO ORA results according to the GO graph in R.
 
 ## TL;DR
