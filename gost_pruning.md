@@ -80,6 +80,7 @@ It performs a series of operations on GO results:
 <!-- end list -->
 
 ``` r
+ 
 pruneGO_GOST <- function(gost_res, 
                           go_sub = c("BP", "MF", "CC"),
                           alpha = 0.05){
@@ -101,19 +102,23 @@ pruneGO_GOST <- function(gost_res,
   gost_res_sig <- gost_res[gost_res$p_value < alpha,]
   
   gost_res_sig$has_sig_children <- sapply(gost_res_sig$term_id, 
-                                           function(x) any(go_haschildren[[x]] %in% gost_res_sig$term_id))
+                                           function(x) any(as.character(go_haschildren[[x]]) %in% gost_res_sig$term_id))
   
   gost_res_sig$keep <- (gost_res_sig$has_children == FALSE) | (gost_res_sig$has_children == TRUE & gost_res_sig$has_sig_children == FALSE) 
   
-  gost_res_ns_childless <- gost_res[which(gost_res$p_value >= alpha & !gost_res$has_children),]
+  if(sum(gost_res$p_value >= alpha) > 0) {
+      gost_res_ns_childless <- gost_res[which(gost_res$p_value >= alpha & !gost_res$has_children),,drop=FALSE]
+  } else {
+      gost_res_ns_childless <- gost_res[which(!gost_res$has_children),,drop=FALSE]  
+  }                                      
   
   pruned <- rbind(gost_res_sig[gost_res_sig$keep,1:14], gost_res_ns_childless[,1:14])
-
-  pruned_len <- length(setdiff(pruned$term_id, gost_res_sig$term_id))
+  pruned_len <- nrow(gost_res_sig) - nrow(pruned)
   
   message("Pruned ", pruned_len, " terms.")
   
   return(pruned)
+
 }
 ```
 
